@@ -17,7 +17,7 @@ outputs = model(inputs)
 
 # Dump memory snapshot history to a file and stop recording
 torch.cuda.memory._dump_snapshot('profile.pkl')
-torch.cuda.memory._record_memory_history(enabled=None)
+torch.cuda.memory._record_memAory_history(enabled=None)
 ```
 
 Running this code generates a `profile.pkl` file that contains a history of GPU memory usage during execution. You can visualize this history at: [https://pytorch.org/memory_viz](https://pytorch.org/memory_viz).
@@ -58,5 +58,57 @@ By dragging and dropping your `profile.pkl` file, you will see a graph like this
 
 The previous example was simplified. In real scenarios, we often train complex models rather than a single linear layer. Additionally, the earlier example did not include the training process. Here, we will examine how GPU memory behaves during a complete training loop for a real large language model.
 
+```python
+import torch
+from transformers import AutoModelForCausalLM
 
+# Start recording memory snapshot history
+torch.cuda.memory._record_memory_history(max_entries=100000)
 
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B").to("cuda")
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+for _ in range(3):
+    inputs = torch.randint(0, 100, (16, 256), device="cuda")  # Dummy input
+    loss = torch.mean(model(inputs).logits)  # Dummy loss
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
+# Dump memory snapshot history to a file and stop recording
+torch.cuda.memory._dump_snapshot("profile.pkl")
+torch.cuda.memory._record_memory_history(enabled=None)
+```
+
+**💡Tip:** When profiling, limit the number of steps. Every GPU memory event is recorded, and the file can become very large. For example, the above code generates an 8 MB file.
+
+Here’s the memory profile for this example:
+
+![Raw training profile](assets/raw_training_profile.png)
+
+This graph is more complex than the previous example, but we still break it down step by step. Notice the three spikes, each corresponding to an iteration of the training loop. Let’s simplify the graph to make it easier to interpret:
+
+![Colorized training profile](assets/colorized_training_profile.png)
+
+1. **Model Initialization**: The first step involves loading the model onto the GPU. The model parameters (==in blue==) occupy memory and remain there until the training ends.
+2. **Forward Pass**: During the forward pass, the activations (intermediate outputs of each layer) are computed and stored in memory for backpropagation. These acitivations, represented ==in orange==, grow layer by layer until the final layer. The loss is calculated at the peak of the orange zone.
+3. **Backward Pass**: The gradients (==in yellow==) are computed and stored during this phase. Simultaneously, the activations are discarded as they are no longer needed, causing the orange zone to shrink. The yellow zone represents memory usage for gradient calculations.
+4. **Optimizer Step**: Gradients are used to update the model’s parameters. Initially, the optimizer itself is initialized (green zone). This initialization is only done once. After that, the optimizer uses the gradients to update the model’s parameters. To update the parameters, the potimizer temporarily stores intermediate values (==red zone==). After the update, both the gradients (yellow) and the intermediate optimizer values (red) are discarded, freeing memory.
+
+At this point, one training iteration is complete. The process repeats for the remaining iterations, producing the three memory spikes visible in the graph.
+
+Training profiles like this typically follow a consistent pattern, which makes them useful for estimating GPU memory requirements for a given model and training loop.
+
+## Estimating Memory Requirements
+
+From the above section, estimating GPU memory requirements seems simple. The total memory needed should correspond to the highest peak in the memory profile, which occurs during the **forward pass**. In that case, the memory requirement is (==blue + green + orange==): **Model Parameters + Optimizer State +Activations**
+
+Is it that simple? Actually, there is a trap. The profile can look different depending on the training setup. For example, reducing the batch size from 16 to 2 changes the picture:
+
+![Colorized training profile 2](assets/colorized_training_profile_2.png)
+
+Now, the highest peaks occur during the **optimizer step** rather than the forward pass. In this case, the memory requirement becomes (==blue + green + yellow +red==): **Model Parameters + Optimizer State + Gradients + Optimizer Intermediates**
+
+To generalize the memory estimation, we need to account for all possible peaks, regardless of whether they occur during the forward pass or optimizer step. **Model Parameters + Optimizer State+max(Gradients+Optimizer Intermediates,Activations)**
+
+Now that we have the equation, let’s see how to estimate each component.
