@@ -50,3 +50,158 @@ def post_init(self):
 
 #### 1.1.2 Forward
 
+```python
+inputs_embeds = self.embed_tokens(input_ids)
+# embed positions
+hidden_states = inputs_embeds
+
+for idx, decoder_layer in enumerate(self.layers):
+    # 将所有的hidden_states保存成tuple
+    if output_hidden_states:
+        all_hidden_states += (hidden_states,)
+    # 将hs送入每一层decoder_layer
+    layer_outputs = decoder_layer(
+        hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_value=past_key_value,
+        output_attentions=output_attentions,
+        use_cache=use_cache,
+    )
+    # 取出上一层decoder_输出的hs,再传入下一个layer
+    # 只要第一个,第二个是cache的一个类，然后进入下一个layer
+    hidden_states = layer_outputs[0]
+    
+# 将最后layers输出后的hidden_states进行标准化  
+hidden_states = self.norm(hidden_states)
+    
+# 加上最后一层的hidden_states
+if output_hidden_states:
+    all_hidden_states += (hidden_states,)
+```
+
+这部分其实跟之前写过的代码没什么区别。最主要的还是要理解模型的结构。
+
+### 1.2 Qwen2DecoderLayer
+
+![img](assets/decoderlayer.png)
+
+解码器的话，主要是三件套：`Attention`+`MLP`+`Norm`，可以看到这里与经典的Transformer的解码器是有一些差异的。比如，**`Norm`换成了`RMSNorm`；两个`Attention`换成了一个。**
+
+```python
+QWEN2_ATTENTION_CLASSES = {
+    "eager": Qwen2Attention,  # 一般情况下是这个
+    "flash_attention_2": Qwen2FlashAttention2,
+    "sdpa": Qwen2SdpaAttention,
+}
+
+class Qwen2DecoderLayer(nn.Module):
+    def __init__(self, config: Qwen2Config):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = QWEN2_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
+
+        self.mlp = Qwen2MLP(config)
+        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+```
+
+感觉这里边的细节应该是要去源码中去看看，应该会发现更多值得学习和考虑的东西。
+
+### 1.3 Qwen2Attention
+
+![img](assets/Qwen2Attention.png)
+
+这部分的代码需要着重去看，核心的东西就在这块！
+
+#### 1.3.1 初始化
+
+核心的参数：
+
+- `num_key_value_heads`：键值对的头数
+- `num_key_value_groups`：键值对的组数
+- `q_proj`,`k_proj`,`v_proj`,`o_proj`四个`Linear`操作。后续`LoRa`也基本都对他动的刀子
+
+```python
+class Qwen2Attention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    def __init__(self, config: Qwen2Config):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.is_causal = True
+        self.attention_dropout = config.attention_dropout
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        
+        self.rotary_emb = Qwen2RotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=self.max_position_embeddings,
+            base=self.rope_theta,
+        )
+```
+
+#### 1.3.2 Forward
+
+这里边值得注意的东西，一个是**旋转位置编码**，它是一种扩展上下文长度的方法，另外还有很多其他的方法，比如**插值法**。另外一个就是`Repeat_KV`操作，因为`V`没有分头，所以需要增加`K`和`V`的尺寸，适配`V`的Size。
+
+```python
+# 获取形状信息,hidden_states输入的为(bs,T,hd)
+bsz, q_len, _ = hidden_states.size()
+
+# 对hidden_states进行Linear生成query、key、value
+query_states = self.q_proj(hidden_states)
+key_states = self.k_proj(hidden_states)
+value_states = self.v_proj(hidden_states)
+
+ # reshape多头处理--分块--(bs,T,heads,hd_d)
+query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+# 将旋转位置嵌入应用于查询和键张量。使用了旋转位置嵌入的余弦和正弦部分，将它们与查询和键张量相乘，并将结果相加，从而实现旋转位置嵌入的效果
+cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+# 先将key_states和value_states重复了num_key_value_groups次
+key_states = repeat_kv(key_states, self.num_key_value_groups)
+value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+# 使用dot attn实现q*kT/hd_d^0.5
+attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+# 然后 attn_weights 加上 attention_mask，实现读取顺序
+attn_weights = attn_weights + attention_mask
+
+# softmax + dropout + values_states相乘
+attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+attn_output = torch.matmul(attn_weights, value_states)
+
+# 转置，修改形状等reshape操作
+attn_output = attn_output.transpose(1, 2).contiguous()
+attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+# 最后在进行一次o_proj
+attn_output = self.o_proj(attn_output)
+
+# 返回结果
+return attn_output, attn_weights, past_key_value
+```
+
