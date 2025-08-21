@@ -205,3 +205,73 @@ attn_output = self.o_proj(attn_output)
 return attn_output, attn_weights, past_key_value
 ```
 
+#### 1.3.3 细节
+
+这里有一些细节需要注意。
+
+##### 1.3.3.1 GQA
+
+首先，多头注意力机制在推理的时候，如果不做任何操作，其每次推理都会重复计算`K`和`V`的历史矩阵，这样是完全浪费计算资源的。所以，KV缓存机制会将历史的`K`和`V`缓存在显存中。
+
+但是，随着上下文长度的不断增加，KV缓存占用的显存不断地在增加，于是研究者想出了一些办法：MQA和GQA。
+
+MQA比较粗暴，他将KV缓存中的`K`和`V`多个头的值全部简化成一个相同的共享值，虽然提升了速度，但是对模型的性能有较大的影响。
+
+既然一个不够，那么就有研究者提出了采用分组的形式，将多个头分组，在每个组内共享`K`和`V`的缓存。
+
+![img](assets/GQA.png)
+
+其示例代码如下：
+
+1. 定义初始张量
+
+   ```python
+   import torch
+   
+   # shape:(batch, seq_len, head, head_dim)
+   q = torch.randn(10, 128, 8, 128)
+   k = torch.randn(10, 128, 8, 128)
+   v = torch.randn(10, 128, 8, 128)
+   
+   # 这里组数就是4了
+   groups = q.shape[-2] // key.shape[-2]
+   ```
+
+2. 为了方便计算，扩展key，value
+
+   ```python
+   def repead_kv(hs:torch.Tensor, n_rep:int) -> torch.Tensor:
+       batch, num_key_value_heads, head_dim = hs.shape
+       if n_rep == 1:
+           return hs
+       hs = hs[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+       # reshape make head -> head * group
+       return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+   ```
+
+3. 矩阵乘法得到score与output 后面就是征程的kqv相乘了
+
+   ```python
+   #(bs, head, seq_len, head_dim)
+   q = q.transpose(1, 2)
+   k = repeat_kv(k.transpose(1, 2), 4)
+   v = repeat_kv(v.transpose(1, 2), 4)
+   scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(head_dim)
+   scores = torch.nn.functional.softmax(scores, dim=-1)
+   
+   out = torch.matmul(scores, v)
+   #上一步转置了，还得转回去
+   out = out.transpose(1, 2)
+   ```
+
+   **为什么要用expand之后再reshape而不能直接用tensor自带的repeat? **
+
+   - `expand`方法用于对张量进行扩展，但不实际分配新的内存。它返回的张量与原始张量共享相同的数据 
+   - `repeat`方法通过实际复制数据来扩展张量。它返回的新张量不与原始张量共享数据，扩展后的张量占用了更多的内存。
+
+
+
+
+
+
+
