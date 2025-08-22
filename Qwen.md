@@ -287,7 +287,7 @@ $$PE_{(pos,2i+1)}=\cos\left(\frac{pos}{10000^{2i/d_{\mathrm{model}}}}\right)$$
 
 那么为什么要采用其他编码方式呢？首先，**绝对位置编码是不可学习的，其次绝对位置编码外推能力不足。**
 
+## 引用
 
-
-
+[DataWhale]:https://github.com/datawhalechina/tiny-universe/tree/main
 
