@@ -194,3 +194,275 @@ with dirver.session() as session:
 
 ## 核心实现
 
+GraphRAG的主要流程如下所示：
+
+![workflow](assets/workflow.png)
+
+GraphRAG的一个核心思想在于，我们需要把用户提供的文档转化为三元组用以构建知识图谱，这样在检索时，对于同一个实体的信息，它们将会被聚集起来。以查询：“小明的个人信息都有哪些？”为例，这样的查询在传统RAG方法中需要召回大量的文本段，并且可能存在召回补全、信息冗余等问题。而通过图数据库，我们可以直接召回小明这个关键实体以及小明实体所连接的边于节点回答用户问题。
+
+因此，第一步，我们需要构建数据预处理模块。**数据预处理模块主要负责对原始数据进行清洗、分词、实体识别和关系抽取，将非结构化数据转换为结构化的图数据格式。**
+
+### 1. 数据预处理
+
+首先，我们需要读取用户上传的文档，然后对文档进行解析。解析的主要目标是得到三元组。由于用户的原始文档内容长度可能超过LLM的最大输入长度。因此，我们需要文档进行分块。
+
+我们采用滑动窗口的策略进行分块，每个片段的长度为segment_length，相邻片段之间有overlap_length的重叠。值得注意的是，还有很多分块策略值得学习！例如：递归分块、语义分块、段落分块。
+
+```python
+def split_text(self, file_path: str, segment_length=300, overlap_length=50) -> Dict:
+    '''
+    将文本文件分割成多个片段，每个片段的长度为segment_length，相邻片段之间有overlap_length的重叠。
+    
+    参数：
+    	- file_path: 文件的路径
+    	- segment_length: 每个片段的长度，默认为300
+    	- overlap_length: 相邻片段之间的重叠长度，默认为50
+    	
+    返回：
+    	- 包含片段ID和片段内容的字典
+    '''
+    chunks = {} # 用于存储片段的字典
+    with open(file_path, 'r', encoding='utf-8') as file:
+        content = file.read()
+        
+    text_segments = [] # 用于存储分割后的文本片段
+    start_index = 0
+    
+    while start_index + segment_length <= len(content):
+        text_segments.append(content[start_index : start_index + segment_length])
+        start_index += segment_length - overlap_length
+    
+    if start_index < len(content):
+        text_segments.append(content[start_index:])
+        
+    for segment in text_segments:
+        chunks.update({compute_mdhash_id(segment, prefix='chunk-'): segment})
+    
+    return chunks
+```
+
+完成分块之后，我们通过LLM对每个分块进行解析，提取三元组。LLM被提示词要求从每个文件块中提取关键实体及其之间的关系。LLM将首先被提示提取文本中的实体，为实体生成简洁的描述性文本。接着根据当前文本块中的实体，LLM被提示从本文中提取这些实体之间的关系，同样生成简洁性的文本。以下面的文本块为例：
+
+```structured text
+在最新的研究中，我们探索了机器学习算法在疾病预测中的潜力。我们使用支持向量机和随机森林算法对医疗数据进行分析。结果表明，这些模型在通过特征选择和交叉验证预测疾病风险方面表现良好。尤其值得一提的是，随机森林模型在处理过拟合问题方面表现出色。此外，我们还探讨了深度学习在医学图像分析中的应用。
+```
+
+LLM被引导提取如下信息：
+
+- 实体
+  - 支持向量机，描述为：“用于分类和回归任务的监督学习模型，在高维空间中特别有效。”
+  - 随机森林算法，描述为：“一种继承学习方法，建立多个决策树并将它们合并在一起以获得更准确、更稳定的预测，通常用于减少过度拟合。”
+- 实体间关系
+  - 支持向量机与随机森林算法，关系描述为：“随机森林算法在处理过拟合问题方面表现优于支持向量机。”
+
+这些提示可以根据语料库所属的具体领域进行定制，例如通过选择领域内具有代表性的少量示例作为上下文，提升LLM的抽取准确性和语义理解能力。
+
+我们定义实体的基本数据结构如下：
+
+```python
+class Entity:
+    name: str # 实体的名称
+    desc: str # 实体的描述
+    chunks_id: list # 实体所属的文本块ID
+    entity_id: str # 实体的唯一ID
+```
+
+抽取实体使用的提示词如下：
+
+```python
+GET_ENTITY = """
+## Goal
+
+You are an experienced machine learning teacher.
+You need to identify the key concepts related to machine learning that the article requires students to master. For each concept, provide a brief description that explains its relevance and importance in the context of the article.
+
+## Example
+
+article:
+"In the latest study, we explored the potential of using machine learning algorithms for disease prediction. We used support vector machines (SVM) and random forest algorithms to analyze medical data. The results showed that these models performed well in predicting disease risk through feature selection and cross-validation. In particular, the random forest model showed better performance in dealing with overfitting problems. In addition, we discussed the application of deep learning in medical image analysis."
+
+response:
+<concept>
+    <name>Support Vector Machine (SVM)</name>
+    <description>A supervised learning model used for classification and regression tasks, particularly effective in high-dimensional spaces.</description>
+</concept>
+<concept>
+    <name>Random Forest Algorithm</name>
+    <description>An ensemble learning method that builds multiple decision trees and merges them together to get a more accurate and stable prediction, often used to reduce overfitting.</description>
+</concept>
+<concept>
+    <name>Feature Selection</name>
+    <description>The process of selecting a subset of relevant features for use in model construction, crucial for improving model performance and reducing complexity.</description>
+</concept>
+<concept>
+    <name>Overfitting</name>
+    <description>A common issue where a model learns the details and noise in the training data to the extent that it negatively impacts the model's performance on new data.</description>
+</concept>
+<concept>
+    <name>Deep Learning</name>
+    <description>A subset of machine learning that uses neural networks with many layers to model complex patterns in large datasets, often applied in image and speech recognition tasks.</description>
+</concept>
+
+## Format
+
+Wrap each concept in the HTML tag <concept>, and include the name of the concept in the <name> tag and its description in the <description> tag.
+
+## Article
+
+{text}
+
+## Your response
+"""
+
+```
+
+收到LLM的回复之后，我们还需要进一步解析LLM的回复以得到可用的实体数据。在上面的提示词中，我们要求LLM的回复格式为HTML格式，因此，我们需要提取指定标签内的内容，可以使用正则表达式来实现。
+
+```python
+def get_text_inside_tag(html_str: str, tag: str):
+    pattern = f"<{tag}>(.*?)<\/{tag}>"
+    try:
+        result = re.findall(pattern, html_str, re.DOTALL)
+        return result
+    except SyntaxError as e:
+        raise ("Json Decode Error: {error}".format(error=e))
+       
+def get_entity(self, text: str, chunk_id: str) -> List[Dict]:
+    '''
+    从给定的文本中提取实体，并为每个实体生成唯一的ID和描述。
+    
+    
+    参数:
+    	- text: 输入的文本
+    	- chunk_id: 文本块的ID
+    	
+   	返回: 
+   		- 包含提取的实体信息的列表
+    '''
+    # 使用LLM提取信息
+    data = self.llm.predict(GET_ENTITY.format(text=text))
+    concepts = []
+    
+    for concept_html in get_text_inside_tag(data, 'concept'):
+        concept = {}
+        concept['name'] = get_text_inside_tag(concept_html, 'name')[0].strip()
+        concept['description'] = get_text_inside_tag(concept_html, 'description')[0].strip()
+        concept['chunks_id'] = [chunk_id]
+        concept['entity_id'] = compute_mdhash_id(
+            concept['description'],
+        	prefix='entity-'
+        )
+        concepts.append(concept)
+    return concepts
+```
+
+完成实体抽取之后，我们根据抽取到的实体信息，通过提示词提示LLM根据这些实体进行三元组的抽取。
+
+抽取三元组的提示词如下：
+
+```python
+GET_TRIPLETS = """
+## Goal
+Identify and extract all the relationships between the given concepts from the provided text.
+Identify as many relationships between the concepts as possible.
+The relationship in the triple should accurately reflect the interaction or connection between the two concepts.
+
+## Guidelines:
+1. **Subject:** The first entity from the given entities.
+2. **Predicate:** The action or relationship linking the subject to the object.
+3. **Object:** The second entity from the given entities.
+
+## Example:
+1. Article :
+    "Gaussian Processes are used to model the objective function in Bayesian Optimization"
+   Given entities:
+   [{{"name": "Gaussian Processes", "entity id": "entity-1"}}, {{"name": "Bayesian Optimization", "entity id": "entity-2"}}]
+   Output:
+   <triplet><subject>Gaussian Processes</subject><subject_id>entity-1</subject_id><predicate>are used to model the objective function in</predicate><object>Bayesian Optimization</object><object_id>entity-2</object_id></triplet>
+
+2. Article :
+    "Hydrogen is a colorless, odorless, non-toxic gas and is the lightest and most abundant element in the universe. Oxygen is a gas that supports combustion and is widely present in the Earth's atmosphere. Water is a compound made up of hydrogen and oxygen, with the chemical formula H2O."
+    Given entities:
+    [{{"name": "Hydrogen", "entity id": "entity-3"}}, {{"name": "Oxygen", "entity id": "entity-4"}}, {{"name": "Water", "entity id": "entity-5"}}]
+    Output:
+    <triplet><subject>Hydrogen</subject><subject_id>entity-3</subject_id><predicate>is a component of</predicate><object>Water</object><object_id>entity-5</object_id></triplet>
+3. Article :
+    "John read a book on the weekend"
+    Given entities:
+    []
+    Output:
+    None
+
+## Format:
+For each identified triplet, provide:
+**the entity should just from "Given Entities"**
+<triplet><subject>[Entity]</subject><subject_id>[Entity ID]</subject_id><predicate>[The action or relationship]</predicate><object>[Entity]</object><object_id>[Entity ID]</object_id></triplet>
+
+## Given Entities:
+{entity}
+
+### Article:
+{text}
+
+## Additional Instructions:
+- Before giving your response, you should analyze and think about it sentence by sentence.
+- Both the subject and object must be selected from the given entities and cannot change their content.
+- If no relevant triplet involving both entities is found, no triplet should be extracted.
+- If there are similar concepts, please rewrite them into a form that suits our requirements.
+
+## Your response:
+"""
+```
+
+当LLM回复我们按照指定格式抽取的三元组后，可以使用正则表达式提取指定标签的内容。
+
+```python
+def get_triplets(self, content, entity: list) -> List[Dict]:
+        """
+        从给定的内容中提取三元组（Triplet）信息，并返回包含这些三元组信息的列表。
+
+        参数:
+        - content: 输入的内容
+        - entity: 实体列表
+
+        返回:
+        - 包含提取的三元组信息的列表
+        """
+        try:
+            # 使用语言模型预测三元组信息
+            data = self.llm.predict(GET_TRIPLETS.format(text=content, entity=entity))
+            data = get_text_inside_tag(data, "triplet")
+        except Exception as e:
+            print(f"Error predicting triplets: {e}")
+            return []
+
+        res = []  # 用于存储提取的三元组信息
+
+        # 从预测结果中提取三元组信息
+        for triplet_data in data:
+            try:
+                subject = get_text_inside_tag(triplet_data, "subject")[0]
+                subject_id = get_text_inside_tag(triplet_data, "subject_id")[0]
+                predicate = get_text_inside_tag(triplet_data, "predicate")[0]
+                object = get_text_inside_tag(triplet_data, "object")[0]
+                object_id = get_text_inside_tag(triplet_data, "object_id")[0]
+                res.append(
+                    {
+                        "subject": subject,
+                        "subject_id": subject_id,
+                        "predicate": predicate,
+                        "object": object,
+                        "object_id": object_id,
+                    }
+                )
+            except Exception as e:
+                print(f"Error extracting triplet: {e}")
+                continue
+
+        return res
+```
+
+
+
+
+
