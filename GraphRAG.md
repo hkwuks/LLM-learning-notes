@@ -462,7 +462,134 @@ def get_triplets(self, content, entity: list) -> List[Dict]:
         return res
 ```
 
+至此，我们已经完成了三元组的抽取。接下来，我们需要将已经抽取的实体数据以及三元组数据导入到neo4j数据库中，在此之前，我们还有必要进行一步实体消岐工作。
 
+在实体、关系的抽取果过程中，某一元素可能在多个文档中重复出现， 因而会被多次检测并记录，产生多个实例。同时，同一实体可能在文档中按照不同的名称出现。在构建知识图谱过程中，这些实例会被整合为图中的单个节点或边，并对其描述进行归纳与总结。
+
+一些同名的实体也不能直接进行合并，这些内容如果不加以处理，直接导入知识图谱的话可能会产生相当严重的错误，比如苹果公司与苹果（水果）这两种实体可能在知识图谱中被整合为一个节点，因此我们需要进行实体消岐。
+
+实体消岐可以分为两个思路，**第一个即为在提取实体时，我们就要求大模型抽取的实体名称要尽可能的唯一，第二个就是当三元组抽取结束后，使用大模型来协助消岐，通过再次检查抽取的内容来判断是否需要进行实体消岐。**
+
+具体做法为，我们检查相同买成的实体，使用大模型检查这些实体的具体内容，接着大模型给出需要被合并的实体名单，我们根据大模型的回复，整合对应的信息。
+
+实体消融使用的提示词如下：
+
+```python
+ENTITY_DISAMBIGUATION = """
+## Goal
+Given multiple entities with the same name, determine if they can be merged into a single entity. If merging is possible, provide the transformation from entity id to entity id.
+
+## Guidelines
+1. **Entities:** A list of entities with the same name.
+2. **Merge:** Determine if the entities can be merged into a single entity.
+3. **Transformation:** If merging is possible, provide the transformation from entity id to entity id.
+
+## Example
+1. Entities:
+   [
+       {"name": "Entity A", "entity id": "entity-1", "description":"..."},
+       {"name": "Entity A", "entity id": "entity-2", "description":"..."},
+       {"name": "Entity A", "entity id": "entity-3", "description":"..."}
+   ]
+
+Your response should be:
+
+<transformation>{"entity-2": "entity-1", "entity-3": "entity-1"}</transformation>
+
+
+2. Entities:
+   [
+       {"name": "Entity B", "entity id": "entity-4", "description":"..."},
+       {"name": "Entity C", "entity id": "entity-5", "description":"..."},
+       {"name": "Entity B", "entity id": "entity-6", "description":"..."}
+   ]
+
+Your response should be:
+
+<transformation>None</transformation>
+
+## Output Format
+Provide the following information:
+- Transformation: A dictionary mapping entity ids to the final entity id after merging.
+
+## Given Entities
+{entities}
+
+## Your response
+"""
+```
+
+如上大模型回复我们哪些实体可以被相似的实体取代，例如实体1可以被实体2取代，那么大模型将回复{“entity-1”: “entity-2”}，我们可以通过这个字典将所有需要被取代的实体的ID更新为取代实体的ID。
+
+```python
+# 此处为伪代码
+entity_names = list(set(entity['name'] for entity in all_entities))
+
+if use_llm_deambiguation:
+    entity_id_mapping = {}
+    for name in entity_names:
+        same_name_entities = [
+            entity for entity in all_entities if entity['name'] == name
+        ]
+        transform_text = self.llm.predict(
+        	ENTITY_DISAMBIGUATION.format(same_name_entities)
+        )
+        entity_id_mapping.update(
+        	get_text_inside_tag(transform_text, "transformation")
+        )
+else: # 如果不使用LLM消岐，那么就直接删除掉重复的实体名称（简单粗暴）
+    entity_id_mapping = {}
+    for entity in all_entities:
+        entity_name = entity["name"]
+        if entity_name not in entity_id_mapping:
+            entity_id_mapping[entity_name] = entity["entity_id"]
+            
+for entity in all_entities:
+    entity['entity_id'] = entity_id_mapping.get(
+        entity['name'], entity['entity_id']) 
+
+triplets_to_remove = [
+    triplet
+    for triplet in all_triplets
+    if entity_id_mapping.get(triplet["subject"], triplet["subject_id"]) is None
+    or entity_id_mapping.get(triplet["object"], triplet["object_id"]) is None
+]
+
+updated_triplets = [
+    {
+        **triplet,
+        "subject_id": entity_id_mapping.get(
+            triplet["subject"], triplet["subject_id"]
+        ),
+        "object_id": entity_id_mapping.get(
+            triplet["object"], triplet["object_id"]
+        ),
+    }
+    for triplet in all_triplets
+    if triplet not in triplets_to_remove
+]
+all_triplets = updated_triplets
+```
+
+完成实体消岐后，我们把三元组中的实体ID更新为消岐后的ID，接着我们合并同一实体的表述信息，以及它们所属的文本块ID。
+
+```python
+entity_map = {}
+
+for entity in all_entities:
+    entity_id = entity["entity id"]
+    if entity_id not in entity_map:
+        entity_map[entity_id] = {
+            "name": entity["name"],
+            "description": entity["description"],
+            "chunks id": [],
+            "entity id": entity_id,
+        }
+    else:
+        entity_map[entity_id]["description"] += " " + entity["description"]
+
+    entity_map[entity_id]["chunks id"].extend(entity["chunks id"])
+```
 
 
 
