@@ -682,3 +682,4 @@ for triplet in all_triplets:
 
 $$Q=\frac{1}{2m}\sum_{i,j}\left[A_{ij}-\gamma\frac{k_{i}k_{j}}{2m}\right]\delta(c_{i},c_{j})$$
 
+其中，$ A_{ij} $表示节点 $ i $ 与节点 $ j $ 之间的边的权重；$ \gamma $为分辨率参数，控制社区规模，默认为 1。
