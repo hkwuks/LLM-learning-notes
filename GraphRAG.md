@@ -591,5 +591,94 @@ for entity in all_entities:
     entity_map[entity_id]["chunks id"].extend(entity["chunks id"])
 ```
 
+最终我们得到的实体信息如图所示，其中embedding信息与community id信息我们将在后续的内容中讲解。
 
+![entities](assets/entities.png)
+
+至此我们已经完成了三元组导入前的所有前置工作，接下来我们就可以向Neo4j数据库中导入实体和三元组了。
+
+三元组的导入我们通过Cypher语句实现：
+
+```cypher
+query = (
+        "MERGE (a:Entity {name: $subject_name, description: $subject_desc, chunks_id: $subject_chunks_id, entity_id: $subject_entity_id}) "
+        "MERGE (b:Entity {name: $object_name, description: $object_desc, chunks_id: $object_chunks_id, entity_id: $object_entity_id}) "
+        "MERGE (a)-[r:Relationship {name: $predicate}]->(b) "
+        "RETURN a, b, r"
+    )
+```
+
+上面的语句即为在Neo4j中创建实体a、实体b以及它们的关系r，我们把提取出的三元组信息导入这个Cypher语句中，然后通过Neo4j的driver执行这个语句，即可实现三元组的导入。
+
+```python
+def create_triplet(self, subject: dict, predicate, object: dict) -> None:
+    """
+    创建一个三元组（Triplet）并将其存储到Neo4j数据库中。
+
+    参数:
+    - subject: 主题实体的字典，包含名称、描述、块ID和实体ID
+    - predicate: 关系名称
+    - object: 对象实体的字典，包含名称、描述、块ID和实体ID
+
+    返回:
+    - 查询结果
+    """
+    # 定义Cypher查询语句，用于创建或合并实体节点和关系
+    query = (
+        "MERGE (a:Entity {name: $subject_name, description: $subject_desc, chunks_id: $subject_chunks_id, entity_id: $subject_entity_id}) "
+        "MERGE (b:Entity {name: $object_name, description: $object_desc, chunks_id: $object_chunks_id, entity_id: $object_entity_id}) "
+        "MERGE (a)-[r:Relationship {name: $predicate}]->(b) "
+        "RETURN a, b, r"
+    )
+
+    # 使用数据库会话执行查询
+    with self.driver.session() as session:
+        result = session.run(
+            query,
+            subject_name=subject["name"],
+            subject_desc=subject["description"],
+            subject_chunks_id=subject["chunks id"],
+            subject_entity_id=subject["entity id"],
+            object_name=object["name"],
+            object_desc=object["description"],
+            object_chunks_id=object["chunks id"],
+            object_entity_id=object["entity id"],
+            predicate=predicate,
+        )
+
+    return
+
+for triplet in all_triplets:
+    subject_id = triplet["subject_id"]
+    object_id = triplet["object_id"]
+
+    subject = entity_map.get(subject_id)
+    object = entity_map.get(object_id)
+    if subject and object:
+        self.create_triplet(subject, triplet["predicate"], object)
+```
+
+导入后的图谱如图所示：
+
+![graph](assets/graph.png)
+
+完成导入后，我们就已经构建出了一个根据文档内容提取出的知识图谱，但是，当前这个图谱仅仅能够处理一些针对一个或者多个实体的问题，面对全局性问题，比如“小明家有几口人”，当前的图谱并不能给出答案。因此，我们还需要进行社区聚类，将图谱中的节点聚类，以实现对全局性问题的处理。
+
+### 2. 社区聚类概览
+
+首先，如果提问“小明家有几口人”，那么我们需要召回一个以小明为中心，扩展N跳的子图。很多全局性的查询都可以用类似的思路解决，区别在于N的大小。以一个更复杂的查询为例：“描述大乔和曹操的关系”，通过查询这两个实体附近的关系以及实体就可以回答对应的信息。因此，在本项目中我们通过聚类算法预先聚类这些实体与关系，形成社区。我们将使用社区信息作为回答全局问题时的参考，这样就不需要进行复杂的图搜索了。
+
+目前**社区检测算法**有很多种，在本项目中，我们选择使用分层的**Leiden社区检测算法**，以递归方式构建社区层级结构：首先在全图中识别出初始社区，然后在每个社区中继续执行子社区检测，直到无法进一步划分为止，最终形成社区树。
+
+分层Leiden算法的流程主要包括：
+
+​	（1） 节点聚合：在固定社区划分的前提下，尝试将每个节点移动到令居节点所属社区，以提升总体模块度。
+
+​	（2）社区细化：对每个社区进行局部划分，确保每个社区子图中的所有节点之间是联通的，防止出现不联通的社区。
+
+​	（3）图聚合：构建新的超图，将每个社区作为一个超级节点，重复第一步，形成递归的社区层级结构。
+
+模块度用于衡量当前社区划分相较于随机划分的好坏程度，其定义如下：
+
+$$Q=\frac{1}{2m}\sum_{i,j}\left[A_{ij}-\gamma\frac{k_{i}k_{j}}{2m}\right]\delta(c_{i},c_{j})$$
 
