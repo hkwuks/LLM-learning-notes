@@ -683,3 +683,121 @@ for triplet in all_triplets:
 $$Q=\frac{1}{2m}\sum_{i,j}\left[A_{ij}-\gamma\frac{k_{i}k_{j}}{2m}\right]\delta(c_{i},c_{j})$$
 
 其中，$ A_{ij} $表示节点 $ i $ 与节点 $ j $ 之间的边的权重；$ \gamma $为分辨率参数，控制社区规模，默认为 1。
+
+$ k_i $表示节点 $ i $ 的度（边的总权重）；$ m $即图中所有边的总权重的一半（即 $ m = \frac{1}{2} \sum_{i,j} A_{ij} ）； c_i $为节点 $ i $ 所属的社区编号；$ \delta(c_i, c_j) $表示当 $ i $ 与 $ j $ 属于同一社区时为 1，否则为 0。
+
+在本文中，使用 Neo4j 的 GDS 库提供的分层 Leiden 算法包对提取出的知识图谱进行社区检测，得到包含节点和关系的社区信息。在社区检测过程中，模块度中的分辨率参数 $ \gamma $ 并非固定不变。具体来说，在越低的层级中，$ \gamma $ 值会逐渐减小，以此鼓励算法在当前社区内进一步划分出更多的子社区，从而实现更细致的社区结构划分。
+
+在社区划分完成后，为社区层级结构中的每个社区生成类报告形式的摘要。这一过程支持对大规模数据集的结构性理解，提供了不依赖具体查询的语义概述，帮助用户快速掌握语料库中各主题的全貌。
+
+例如，用户可以浏览某一层级的社区摘要以确定感兴趣的主题，并进一步阅读下级社区的报告，获取更细粒度的信息。尽管这些摘要本身具有独立意义，但本文主要关注其作为图索引机制的一部分，在响应全局性查询时的效用。
+
+摘要的生成采用模版方法，逐步将图中节点、边及其声明的摘要填充到社区摘要模版中。较低层级的社区摘要将作为上层社区摘要生成的基础。具体步骤如下：
+
+1. 对于叶级社区，从图中提取的节点和边的摘要被按优先级排序加入到LLM上下文窗口中。排序的标准是：依据边的源节点和目标节点的整体度量（即显著性）降序排序。一次添加源节点描述、目标节点描述、边描述。
+2. 对于高级社区，若所有元素摘要在上下文窗口的token限制内可容纳，则按叶级社区的方法汇总所有元素摘要；否则，将子社区按摘要的token数量降序排序，逐步用更短的子社区摘要替换较长的元素摘要，直到整体摘要符合上下文窗口限制。
+
+### 3. 社区检测实现
+
+在了解完我们使用的社区检测算法后，实际上实现相当简单，由于Neo4j提供了GDS库，我们只需要调用GDS库中的分层Leiden算法包即可。
+
+```python
+def detect_communities(self) -> None:
+    query = """
+    CALL gds.graph.project(
+        'graph_help',
+        ['Entity'],
+        {
+            Relationship: {
+                orientation: 'UNDIRECTED'
+            }
+        }
+    )
+    """
+    with self.driver.session() as sesion:
+        result = session.run(query)
+    
+    query = """
+    CALL gds.leiden.write('graph_help', {
+        writeProperty: 'communityIds',
+        includeIntermediateCommunities: True,
+        maxLevels: 10,
+        tolerance: 0.0001,
+        gamma: 1.0,
+        theta: 0.01
+    })
+    YIELD communityCount, modularity, modularities
+    """
+    with self.driver.session() as session:
+        result = session.run(query)
+        for record in result:
+            print(
+                f"社区数量: {record['communityCount']}, 模块度: {record['modularity']}"
+            )
+        session.run("CALL gds.graph.drop('graph_help')")
+```
+
+完成社区检测后，我们为每个节点增加它们所属的社区属性。很明显，同一个节点可能属于不同社区，所以这里的communityIds实际上是一个列表。
+
+社区检测完之后，我们为社区生成一个schema，这个schema包含了社区的层次结构、社区内包含的节点、边等信息。作为一个单独的结构存储社区信息。
+
+```python
+def gen_community_schema(self) -> dict[str, dict]:
+    results = defaultdict(
+    	lambda: dict(
+            level=None,
+            title=None,
+            edges=set(),
+            nodes=set(),
+            chunk_ids=set(),
+            sub_communities=[],
+        )
+    )
+    with self.driver.session() as session:
+        # Fetch community data
+        result = session.run(
+            f"""
+            MATCH (n:Entity)
+            WITH n, n.communityIds AS communityIds, [(n)-[]-(m:Entity) | m.entity_id] AS connected_nodes
+            RETURN n.entity_id AS node_id,
+                    communityIds AS cluster_key,
+                    connected_nodes
+            """
+        )
+        
+        max_num_ids = 0
+        for record in result:
+            for index, c_id in enumerate(record['cluster_key']):
+                node_id = str(record['node_id'])
+                level = index
+                cluster_key = str(c_id)
+                connected_nodes = record["connected_nodes"]
+
+                results[cluster_key]["level"] = level
+                results[cluster_key]["title"] = f"Cluster {cluster_key}"
+                results[cluster_key]["nodes"].add(node_id)
+                results[cluster_key]["edges"].update(
+                    [
+                        tuple(sorted([node_id, str(connected)]))
+                        for connected in connected_nodes
+                        if connected != node_id
+                    ]
+                )
+        for k, v in results.items():
+            v["edges"] = [list(e) for e in v["edges"]]
+            v["nodes"] = list(v["nodes"])
+            v["chunk_ids"] = list(v["chunk_ids"])
+        for cluster in results.values():
+            cluster["sub_communities"] = [
+                sub_key
+                for sub_key, sub_cluster in results.items()
+                if sub_cluster["level"] > cluster["level"]
+                and set(sub_cluster["nodes"]).issubset(set(cluster["nodes"]))
+            ]
+
+    return dict(results)
+```
+
+### 4. 社区摘要生成
+
+完成社区聚类后，接下来我们就是根据社区内节点的内容生成该社区的摘要，反馈这个社区内的核心内容。我们只需要使用LLM读取社区内节点与关系的描述，最后总结即可。
