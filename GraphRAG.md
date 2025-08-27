@@ -800,4 +800,65 @@ def gen_community_schema(self) -> dict[str, dict]:
 
 ### 4. 社区摘要生成
 
-完成社区聚类后，接下来我们就是根据社区内节点的内容生成该社区的摘要，反馈这个社区内的核心内容。我们只需要使用LLM读取社区内节点与关系的描述，最后总结即可。
+完成社区聚类后，接下来我们就是根据社区内节点的内容生成该社区的摘要，反馈这个社区内的核心内容。我们只需要使用LLM读取社区内节点与关系的描述，最后总结即可。但是，本文在处理摘要时使用了比较直接的思路，即每个社区的信息都导入LLM让其生成摘要。**但实际上更优的做法是我们在撰写社区摘要时，需要从下往上生成，因为过大的社区可能造成超过LLM的token限制，而从下往上的处理方式使得我们可以跳过一些已经生成过摘要的子社区，直接将子社区的摘要作为一部分节点的描述，从而最大程度减小token消耗。**
+
+```python
+def generate_community_report(self):
+    communities_schema = self.read_community_schema()
+    for community_key, community in tqdm(
+    	communities_schema.items(), desc='generating community report'
+    ):
+        community['report'] = self.gen_single_community_report(community)
+    with open(self.community_path, 'w', encoding='utf-8') as file:
+        json.dump(communities_schema, file, indent=4)
+    print('All community report has been generated.')
+        
+def gen_single_community_report(self, community: dict):
+    nodes = community["nodes"]
+    edges = community["edges"]
+    nodes_describe = []
+    edges_describe = []
+    for i in nodes:
+        node = self.get_node_by_id(i)
+        nodes_describe.append({"name": node["name"], "desc": node["description"]})
+    for i in edges:
+        edge = self.get_edges_by_id(i[0], i[1])
+        edges_describe.append(
+            {"source": edge["src"], "target": edge["tar"], "desc": edge["r"]}
+        )
+    nodes_csv = "entity,description\n"
+    for node in nodes_describe:
+        nodes_csv += f"{node['name']},{node['desc']}\n"
+    edges_csv = "source,target,description\n"
+    for edge in edges_describe:
+        edges_csv += f"{edge['source']},{edge['target']},{edge['desc']}\n"
+    data = f"""
+    Text:
+    -----Entities-----
+    ```csv
+    {nodes_csv}
+    ```
+    -----Relationships-----
+    ```csv
+    {edges_csv}
+    ```
+    """
+    prompt = GEN_COMMUNITY_REPORT.format(input_text=data)
+    report = self.llm.predict(prompt)
+    return report
+    
+```
+
+我们读取每个社区内的节点与边的描述，然后将它们整理之后导入LLM，让LLM生成社区摘要。社区摘要主要包括社区名称、社区总结以及社区内需要关注的要点信息，经过如上处理之后，我们就得到了聚类之后社区的主要信息都是什么了。我们使用的prompt如下：
+
+```python
+GEN_COMMUNITY_REPORT = '''
+## Role
+You are an AI assistant that helps a human analyst to perform general information discovery.
+Information discovery is the process of identifying and assessing relevant information associated with certain entities (e.g., organizations and individuals) within a network.
+
+## Goal
+write 
+'''
+```
+
