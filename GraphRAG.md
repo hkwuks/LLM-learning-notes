@@ -1033,3 +1033,226 @@ def add_embedding_for_graph(self):
 **然后系统会根据评分，从所有中间响应中挑选出最重要的若干信息点，组成一个高质量的全局上下文。这些信息点跨越不同的社区，构成了一个面向复杂查询的知识核心。**
 
 最后，这个上下文连同原始问题一起被输入到LLM中，生成最终的答案。通过这种方式，全局查询不仅能覆盖广泛的实体与关系，还能整合跨越社区的背景信息，提供更深入、综合的回答。
+
+### 7. 局部查询算法实现
+
+如前文所述，首先我们需要将用户的查询转化为向量
+
+```python
+query_emb = self.embedding.get_emb(query)
+```
+
+接着我们需要查询与用户查询相似度最高的实体。我们遍历图中所有节点，计算它们与用户查询的相似度，然后返账相似度最高的K个节点。**这里实际上Neo4j提供了简单的实现，感兴趣可以自行查阅**。
+
+```python
+topk_similar_entities_context = self.get_topk_similar_entities(query_emb)
+
+def get_topk_similar_entities(self, input_emb, k=1) -> List[Node]:
+    res = []
+    query = """
+    MATCH (n)
+    RETURN n
+    """
+    with self.driver.session() as session:
+        result = session.run(query)
+    for record in result:
+        node = record["n"]
+        if node["embedding"] is not None:
+            similarity = cosine_similarity(input_emb, node["embedding"])
+            node = Node(
+                name=node["name"],
+                desc=node["description"],
+                chunks_id=node["chunks_id"],
+                entity_id=node["entity_id"],
+                similarity=similarity,
+            )
+            res.append(node)
+    return sorted(res, key=lambda x: x.similarity, reverse=True)[:k]
+```
+
+获取这些节点后，我们将获取这些节点相连的社区、关系、文本块信息，用于回复用户的查询。
+
+```python
+topk_similar_communities_context = self.get_communities(
+    topk_similar_entities_context
+)
+topk_similar_relations_context = self.get_relations(
+    topk_similar_entities_context, query
+)
+topk_similar_chunks_context = self.get_chunks(
+    topk_similar_entities_context, query
+)
+
+def get_communities(self, nodes: List[Node]):
+    communities_schema = self.read_community_schema()
+    res = []
+    nodes_ids = [i.entity_id for i in nodes]
+    for community_id, community_info in communities_schema.items():
+        if set(nodes_ids) & set(community_info["nodes"]):
+            res.append(
+                {
+                    "community_id": community_id,
+                    "community_info": community_info["report"],
+                }
+            )
+    return res
+
+def get_relations(self, nodes: List, input_emb):
+    res = []
+    for i in nodes:
+        res.append(self.get_node_edgs(i))
+    return res
+
+def get_chunks(self, nodes, input_emb):
+    chunks = []
+    for i in nodes:
+        chunks.append(self.get_node_chunks(i))
+    return chunks
+```
+
+获取完成后，整理上述信息，将其输入LLM中得到回复。
+
+```python
+return f"""
+	-----Reports-----
+    ```csv
+    {topk_similar_communities_context}
+    \```
+    -----Entities-----
+    ```csv
+    {topk_similar_entities_context}
+    \```
+    -----Relationships-----
+    ```csv
+    {topk_similar_relations_context}
+    \```
+    -----Sources-----
+    ```csv
+    {topk_similar_chunks_context}
+    \```
+"""
+
+LOCAL_QUERY = """
+## User Query
+{query}
+## Context
+{context}
+## Task
+Based on given context, please provide a response to the user query.
+## Your Response
+"""
+
+def local_query(self, query):
+    context = self.build_local_query_context(query)
+    prompt = LOCAL_QUERY.format(query=query, context=context)
+    response = self.llm.predict(prompt)
+    return response
+
+```
+
+至此，我们就实现了局部查询算法。
+
+### 8. 全局查询算法实现
+
+与局部查询相同，首先需要将用户的查询转化为向量
+
+```python
+query_emb = self.embedding.get_emb(query)
+```
+
+我们在全局查询前往往需要先确定查询的范围，如果涉及超大的社区，那我们必须优先从大社区开始，因此全局查询中存在参数level，用以指定查询的范围，不符合指定level的社区将被过滤掉。
+
+```python
+def map_community_points(self, community_info, query):
+    points_html = self.llm.predict(
+    	GLOBAL_MAP_POINTS.format(comtext_data=community_info, query=query)
+    )
+    points = get_text_inside_tag(points_html, 'point')
+    res = []
+    for point in points:
+        try:
+            score = get_text_inside_tag(point, 'score')[0]
+            desc = get_text_inside_tag(point, 'description')[0]
+            res.append((desc, score))
+        except:
+            continue
+    return res
+
+GLOBAL_MAP_POINTS = """
+You are a helpful assistant responding to questions about data in the tables provided.
+
+
+---Goal---
+
+Generate a response consisting of a list of key points that responds to the user's question, summarizing all relevant information in the input data tables.
+
+You should use the data provided in the data tables below as the primary context for generating the response.
+If you don't know the answer or if the input data tables do not contain sufficient information to provide an answer, just say so. Do not make anything up.
+
+Each key point in the response should have the following element:
+- Description: A comprehensive description of the point.
+- Importance Score: An integer score between 0-100 that indicates how important the point is in answering the user's question. An 'I don't know' type of response should have a score of 0.
+
+The response should be HTML formatted as follows:
+
+
+<point><description>"Description of point 1..."</description><score>score_value</score></point>
+<point><description>"Description of point 2..."</description><score>score_value</score></point>
+
+
+The response shall preserve the original meaning and use of modal verbs such as "shall", "may" or "will".
+Do not include information where the supporting evidence for it is not provided.
+
+
+---Data tables---
+
+{context_data}
+
+---User query---
+
+{query}
+"""
+
+def build_global_query_context(self, query, level=1):
+    communities_schema = self.read_community_schema()
+    candidate_comunity = {}
+    points = []
+    for communityid, community_info in candidate_schema.items():
+        if community_info['level'] < level:
+            candidate_community.update({communityid: community_info})
+    for communityid, community_info in candidate_community.items():
+   		points.extend(self.map_community_points(community_info['report'], query))
+    points = sorted(points, key=lambda x: x[-1], reverse=True)
+    return points
+```
+
+至此，我们已经完成了社区内容的提取，接着我们把这些内容传递给LLM，LLM根据这些内容回答用户的问题。
+
+```python
+def global_query(self, query, level=1):
+        context = self.build_global_query_context(query, level)
+        prompt = GLOBAL_QUERY.format(query=query, context=context)
+        response = self.llm.predict(prompt)
+        return response
+
+GLOBAL_QUERY = """
+## User Query
+{query}
+## Context
+{context}
+## Task
+Based on given context, please provide a response to the user query.
+## Your Response
+"""
+```
+
+至此，我们就完成了全局查询算法的实现。
+
+## 写在最后
+
+这是一个比较简单的GraphRAG系统的思路和实现。GraphRAG算法仍然存在诸多未解决的问题。比如：由于社区的存在，知识图谱的增删改操作变得格外复杂；同时，固定的社区结构也很难适应多样的查询类型。
+
+如果你想用于生成环境，这个文档的方法还很简单，你可以参考[GraphRAG](https://github.com/microsoft/graphrag)和[nano-graphrag](https://github.com/gusye1234/nano-graphrag)。
+
+
+
