@@ -852,13 +852,184 @@ def gen_single_community_report(self, community: dict):
 我们读取每个社区内的节点与边的描述，然后将它们整理之后导入LLM，让LLM生成社区摘要。社区摘要主要包括社区名称、社区总结以及社区内需要关注的要点信息，经过如上处理之后，我们就得到了聚类之后社区的主要信息都是什么了。我们使用的prompt如下：
 
 ```python
-GEN_COMMUNITY_REPORT = '''
+GEN_COMMUNITY_REPORT = """
 ## Role
 You are an AI assistant that helps a human analyst to perform general information discovery.
 Information discovery is the process of identifying and assessing relevant information associated with certain entities (e.g., organizations and individuals) within a network.
 
 ## Goal
-write 
-'''
+Write a comprehensive report of a community.
+Given a list of entities that belong to the community as well as their relationships and optional associated claims. The report will be used to inform decision-makers about information associated with the community and their potential impact.
+The content of this report includes an overview of the community's key entities, their legal compliance, technical capabilities, reputation, and noteworthy claims.
+
+## Report Structure
+
+The report should include the following sections:
+
+- TITLE: community's name that represents its key entities - title should be short but specific. When possible, include representative named entities in the title.
+- SUMMARY: An executive summary of the community's overall structure, how its entities are related to each other, and significant information associated with its entities.
+- DETAILED FINDINGS: A list of 5-10 key insights about the community. Each insight should have a short summary followed by multiple paragraphs of explanatory text grounded according to the grounding rules below. Be comprehensive.
+
+Return output as a well-formed JSON-formatted string with the following format:
+{{
+"title": <report_title>,
+"summary": <executive_summary>,
+"findings": [
+{{
+"summary":<insight_1_summary>,
+"explanation": <insight_1_explanation>
+}},
+{{
+"summary":<insight_2_summary>,
+"explanation": <insight_2_explanation>
+}}
+...
+]
+}}
+
+## Grounding Rules
+Do not include information where the supporting evidence for it is not provided.
+
+## Example Input
+-----------
+Text:
+
+
+Entities:
+
+```csv
+entity,description
+VERDANT OASIS PLAZA,Verdant Oasis Plaza is the location of the Unity March
+HARMONY ASSEMBLY,Harmony Assembly is an organization that is holding a march at Verdant Oasis Plaza
+\```
+
+Relationships:
+
+```csv
+source,target,description
+VERDANT OASIS PLAZA,UNITY MARCH,Verdant Oasis Plaza is the location of the Unity March
+VERDANT OASIS PLAZA,HARMONY ASSEMBLY,Harmony Assembly is holding a march at Verdant Oasis Plaza
+VERDANT OASIS PLAZA,UNITY MARCH,The Unity March is taking place at Verdant Oasis Plaza
+VERDANT OASIS PLAZA,TRIBUNE SPOTLIGHT,Tribune Spotlight is reporting on the Unity march taking place at Verdant Oasis Plaza
+VERDANT OASIS PLAZA,BAILEY ASADI,Bailey Asadi is speaking at Verdant Oasis Plaza about the march
+HARMONY ASSEMBLY,UNITY MARCH,Harmony Assembly is organizing the Unity March
+\```
+
+\```
+Output:
+{{
+"title": "Verdant Oasis Plaza and Unity March",
+"summary": "The community revolves around the Verdant Oasis Plaza, which is the location of the Unity March. The plaza has relationships with the Harmony Assembly, Unity March, and Tribune Spotlight, all of which are associated with the march event.",
+"findings": [
+{{
+"summary": "Verdant Oasis Plaza as the central location",
+"explanation": "Verdant Oasis Plaza is the central entity in this community, serving as the location for the Unity March. This plaza is the common link between all other entities, suggesting its significance in the community. The plaza's association with the march could potentially lead to issues such as public disorder or conflict, depending on the nature of the march and the reactions it provokes."
+}},
+{{
+"summary": "Harmony Assembly's role in the community",
+"explanation": "Harmony Assembly is another key entity in this community, being the organizer of the march at Verdant Oasis Plaza. The nature of Harmony Assembly and its march could be a potential source of threat, depending on their objectives and the reactions they provoke. The relationship between Harmony Assembly and the plaza is crucial in understanding the dynamics of this community."
+}},
+{{
+"summary": "Unity March as a significant event",
+"explanation": "The Unity March is a significant event taking place at Verdant Oasis Plaza. This event is a key factor in the community's dynamics and could be a potential source of threat, depending on the nature of the march and the reactions it provokes. The relationship between the march and the plaza is crucial in understanding the dynamics of this community."
+}},
+{{
+"summary": "Role of Tribune Spotlight",
+"explanation": "Tribune Spotlight is reporting on the Unity March taking place in Verdant Oasis Plaza. This suggests that the event has attracted media attention, which could amplify its impact on the community. The role of Tribune Spotlight could be significant in shaping public perception of the event and the entities involved."
+}}
+]
+}}
+
+## Real Data
+Use the following text for your answer. Do not make anything up in your answer.
+
+Text:
+
+{input_text}
+
+The report should include the following sections:
+
+- TITLE: community's name that represents its key entities - title should be short but specific. When possible, include representative named entities in the title.
+- SUMMARY: An executive summary of the community's overall structure, how its entities are related to each other, and significant information associated with its entities.
+- DETAILED FINDINGS: A list of 5-10 key insights about the community. Each insight should have a short summary followed by multiple paragraphs of explanatory text grounded according to the grounding rules below. Be comprehensive.
+
+Return output as a well-formed JSON-formatted string with the following format:
+{{
+"title": <report_title>,
+"summary": <executive_summary>,
+"rating": <impact_severity_rating>,
+"rating_explanation": <rating_explanation>,
+"findings": [
+{{
+"summary":<insight_1_summary>,
+"explanation": <insight_1_explanation>
+}},
+{{
+"summary":<insight_2_summary>,
+"explanation": <insight_2_explanation>
+}}
+...
+]
+}}
+
+## Grounding Rules
+Do not include information where the supporting evidence for it is not provided.
+
+Output:
+"""
 ```
 
+至此我们就完成了社区部分的工作。接下来，我们将准备检索算法部分。
+
+### 5. 节点嵌入生成
+
+目前得到的图，我们还无法直接用于检索，因为我们没有为图中的任何组件生成嵌入（Embedding），嵌入是检索算法的核心之一，我们需要把原本的文本信息转化为向量，这样我们就可以使用向量相似度来衡量文本之间的相似度，帮助我们判断哪些信息对于回复用户信息最有帮助。
+
+嵌入的生成实际上相当简单，我们只需要调用zhipuAI提供的Embedding模型API即可。我们通过遍历图中的所有节点，然后为每个节点生成嵌入，最后将嵌入存储在节点的embedding属性中。
+
+```python
+def add_embedding_for_graph(self):
+    query = '''
+    MATCH (n)
+    return n
+    '''
+    with self.driver.session() as session:
+        result = session.run(query)
+        for record in result:
+            node = record['n']
+            description = node['description']
+            id = node['entity_id']
+            embedding = self.embedding.get_emb(description)
+            # 更新节点，添加新的embedding属性
+            update_query = '''
+            MATCH (n {entity_id: $id})
+            SET n.embedding = $embedding
+            '''
+            session.run(update_query, id=id, embedding=embedding)
+```
+
+### 6. 检索算法概述
+
+**局部查询算法**流程图如下：
+
+![local](assets/local.png)
+
+局部查询方法主要用于回答那些聚焦于单一或少数几个实体的问题，比如“孙悟空的生平”或“矢车菊的治疗特性”。这种方法通过一系列步骤，从知识图谱和原始语料中提取与查询密切相关的信息，以构建精准的上下文，并最终生成高质量的回答。
+
+**系统首先将用户查询转化为向量，捕捉其语义。接着，计算知识图谱中实体节点向量与查询向量的相似度，筛选出相似度超过阈值的相关实体。之后，系统提取这些实体的邻节点和边，在原始文本中查找相关内容片段。最终，将相关实体、邻居节点和文本片段组合成局部上下文窗口，输入LLM生成答案。**
+
+**全局查询算法**流程图如下：
+
+![global](assets/global.png)
+
+全局查询方法适用于更复杂的问题，尤其是那些需要跨越多个知识图谱社区、结构性较强的查询，比如“曹操与大乔之间的联系”。这种类型的问题通常难以通过关注单一实体来解决，因此需要更宏观的视角和层级化的信息整合。
+
+整个流程围绕社区结构展开。知识图谱被组织成多层的社区集合，每一层的社区代表一组语义相关的实体节点，每个社区都有一个由LLM生成的摘要，简单概括了该社区的主要信息。
+
+**处理这类查询时，系统首先将用户提出的问题转换为一个向量表示，用于捕捉其深层语义。随后，它会将这个向量与所有社区摘要的嵌入进行比较，筛选出与查询最相关的一组社区。这一筛选基于相似度阈值，确保只保留与查询密切相关的区域。（阈值的选择其实是一个需要考虑的问题）**
+
+**接下来，系统会把这些相关社区的摘要进一步切分成较小的文本块，每一块单独输入到LLM中进行处理。LLM会为每个文本块生成一个中间响应，识别出若干关键信息点，并为每个信息点打分，以反映其对回答问题的贡献度。**
+
+**然后系统会根据评分，从所有中间响应中挑选出最重要的若干信息点，组成一个高质量的全局上下文。这些信息点跨越不同的社区，构成了一个面向复杂查询的知识核心。**
+
+最后，这个上下文连同原始问题一起被输入到LLM中，生成最终的答案。通过这种方式，全局查询不仅能覆盖广泛的实体与关系，还能整合跨越社区的背景信息，提供更深入、综合的回答。
