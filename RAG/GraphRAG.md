@@ -837,7 +837,7 @@ def gen_single_community_report(self, community: dict):
     -----Entities-----
     ```csv
     {nodes_csv}
-    ```
+```
     -----Relationships-----
     ```csv
     {edges_csv}
@@ -846,7 +846,7 @@ def gen_single_community_report(self, community: dict):
     prompt = GEN_COMMUNITY_REPORT.format(input_text=data)
     report = self.llm.predict(prompt)
     return report
-    
+
 ```
 
 我们读取每个社区内的节点与边的描述，然后将它们整理之后导入LLM，让LLM生成社区摘要。社区摘要主要包括社区名称、社区总结以及社区内需要关注的要点信息，经过如上处理之后，我们就得到了聚类之后社区的主要信息都是什么了。我们使用的prompt如下：
