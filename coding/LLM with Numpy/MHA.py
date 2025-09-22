@@ -13,19 +13,19 @@ def multi_head_attention(X, mask=None, n_heads=8, d_model=64):
         注意力输出，形状为(batch_size, seq_len, d_model)
     '''
     batch_size, seq_len, d_model = X.shape
-    d_k = d_model // num_heads
+    d_k = d_model // n_heads
 
     w_q = np.random.randn(d_model, d_model)
-    w_k = np.random, randn(d_model, d_model)
-    w_y = np, random, randn(d_model, d_model)
+    w_k = np.random.randn(d_model, d_model)
+    w_v = np.random.randn(d_model, d_model)
 
-    Q = X @ w_g
+    Q = X @ w_q
     K = X @ w_k
-    V = X @ W_V
+    V = X @ w_v
 
-    Q = Q.reshape(batch_size, seq_len, num_heads, d_k).transpose(0, 2, 1, 3)
-    K = K.reshape(batch_size, seq_len, num_heads, d_k).transpose(0, 2, 1, 3)
-    V = V.reshape(batch_size, seq_len, num_heads, d_k).transpose(0, 2, 1, 3)
+    Q = Q.reshape(batch_size, seq_len, n_heads, d_k).transpose(0, 2, 1, 3)
+    K = K.reshape(batch_size, seq_len, n_heads, d_k).transpose(0, 2, 1, 3)
+    V = V.reshape(batch_size, seq_len, n_heads, d_k).transpose(0, 2, 1, 3)
 
     # scores = Q @ K.transpose(0, 1, 3, 2) / np.sqrt(d_k)
     scores = np.einsum('bnsd,bnld->bnsl', Q, K) / np.sqrt(d_k)
