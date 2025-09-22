@@ -1,14 +1,13 @@
 import numpy as np
 
 
-def MultiQueryAttention(X, mask=None, n_heads=8, d_model=512):
+def MultiQueryAttention(X, mask=None, n_heads=8):
     '''
         实现多查询共享注意力机制
         Args:
             X:输入张量，形状为(batch_size, seq_len, d_model)
             mask: 掩码张量，形状为(batch_size, seq_len, seq_len)，mask的作用是掩盖padding或掩盖后面的Token
             num_heads: 头数量
-            d_model: 模型维度
         Returns:
             注意力输出，形状为(batch_size, seq_len, d_model)
         '''
