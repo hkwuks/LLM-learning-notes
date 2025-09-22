@@ -1,7 +1,7 @@
 import numpy as np
 
 
-def multi_head_attention(X, mask=None, n_heads=8, d_model=64):
+def MultiHeadAttention(X, mask=None, n_heads=8, d_model=64):
     '''
     实现多头注意力机制
     Args:
@@ -41,3 +41,9 @@ def multi_head_attention(X, mask=None, n_heads=8, d_model=64):
     combined = weighted_values.reshape(batch_size, seq_len, -1)
 
     return combined
+
+
+matrix = np.random.randn(10, 10, 64)
+output = MultiHeadAttention(matrix)
+print(output)
+print(output.shape)
