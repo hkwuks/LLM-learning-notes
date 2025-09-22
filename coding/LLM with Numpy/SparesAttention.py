@@ -9,6 +9,7 @@ def SparesAttention(X, mask=None, n_heads=8, window_size=3):
         mask: 掩码张量，形状为(batch_size, seq_len, seq_len)，mask的作用是掩盖padding或掩盖后面的Token
         num_heads: 头数量
         n_groups: 分组数量
+        window_size: 注意力窗口大小
     Returns:
         注意力输出，形状为(batch_size, seq_len, d_model)
     '''
