@@ -1,12 +1,14 @@
 import numpy as np
 
 
-def multi_head_attention(X, num_heads):
+def multi_head_attention(X, mask=None, n_heads=8, d_model=64):
     '''
     实现多头注意力机制
     Args:
         X:输入张量，形状为(batch_size, seq_len, d_model)
-        num_heads:头数量
+        mask: 掩码张量，形状为(batch_size, seq_len, seq_len)，mask的作用是掩盖padding或掩盖后面的Token
+        num_heads: 头数量
+        d_model: 模型维度
     Returns:
         注意力输出，形状为(batch_size, seq_len, d_model)
     '''
@@ -29,6 +31,9 @@ def multi_head_attention(X, num_heads):
     scores = np.einsum('bnsd,bnld->bnsl', Q, K) / np.sqrt(d_k)
     scores = np.exp(scores - np.max(scores, axis=3, keepdims=True))
     scores /= np.sum(scores, axis=3, keepdims=True)
+
+    if mask is not None:
+        scores = np.where(mask == 0, scores, -np.inf)
 
     # weighted_values = scores @ V
     weighted_values = np.einsum('bnss,bnsd->bnsd', scores, V)
