@@ -17,6 +17,7 @@ def MultiHeadAttention(X, mask=None, n_heads=8):
     w_q = np.random.randn(d_model, d_model)
     w_k = np.random.randn(d_model, d_model)
     w_v = np.random.randn(d_model, d_model)
+    w_o = np.random.randn(d_model, d_model)
 
     Q = X @ w_q
     K = X @ w_k
@@ -27,7 +28,7 @@ def MultiHeadAttention(X, mask=None, n_heads=8):
     V = V.reshape(batch_size, seq_len, n_heads, d_k).transpose(0, 2, 1, 3)
 
     # scores = Q @ K.transpose(0, 1, 3, 2) / np.sqrt(d_k)
-    scores = np.einsum('bnsd,bnld->bnsl', Q, K) / np.sqrt(d_k)
+    scores = np.einsum('bhld,bhsd->bhls', Q, K) / np.sqrt(d_k)
     scores = np.exp(scores - np.max(scores, axis=3, keepdims=True))
     scores /= np.sum(scores, axis=3, keepdims=True)
 
@@ -35,11 +36,10 @@ def MultiHeadAttention(X, mask=None, n_heads=8):
         scores = np.where(mask == 0, scores, -np.inf)
 
     # weighted_values = scores @ V
-    weighted_values = np.einsum('bnss,bnsd->bnsd', scores, V)
+    weighted_values = np.einsum('bhss,bhsd->bhsd', scores, V)
 
-    combined = weighted_values.reshape(batch_size, seq_len, -1)
-
-    return combined
+    combined = weighted_values.reshape(batch_size, seq_len, d_model)
+    return combined @ w_o
 
 
 matrix = np.random.randn(10, 10, 64)
